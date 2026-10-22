@@ -120,7 +120,7 @@ python3 scanner.py -u https://example.com --sapi fpm
 -k, --insecure    Disable TLS certificate verification
 -H, --header      Custom header (can be used multiple times)
 -v, --verbose     Show verdict reasons and response snippets
--q, --quiet       Only output vulnerable hosts
+-q, --quiet       Only output vulnerable hosts, or WAF checks not confirmed blocked
 --no-color        Disable colored output
 --waf-check       Check selective WAF blocking using only small multipart requests
 --sapi            Verdict rules: auto, mod_php, or fpm (default: auto)
@@ -140,7 +140,7 @@ Matt Suiche, Tolmo ([@msuiche](https://github.com/msuiche)).
 
 ## Output
 
-Results are printed to the terminal. When using `-o`, vulnerable hosts are saved to a JSON file with the verdict reason and redacted HTTP request/response evidence.
+Results are printed to the terminal. When using `-o`, vulnerable hosts are saved to a JSON file with the verdict reason and redacted HTTP request/response evidence. Use `--all-results` to save all vulnerability-scan results. In `--waf-check` mode, all WAF results are saved automatically.
 
 ## Limitations
 
