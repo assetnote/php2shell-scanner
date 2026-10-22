@@ -18,6 +18,44 @@ The default `--sapi auto` mode applies both mod_php and PHP-FPM verdict rules, m
 
 Each tested path may receive a 42-byte control request and three probes totalling about 29 MiB. Probing stops as soon as the verdict is settled, and duplicate input URLs are scanned once.
 
+### Lightweight WAF check
+
+Use `--waf-check` to check edge mitigation with small requests instead of the
+memory-pressure probes:
+
+```
+python3 scanner.py -u https://example.com/upload.php --waf-check
+python3 scanner.py -l hosts.txt --waf-check -o waf-results.json
+```
+
+Each tested path receives a benign multipart control request followed by an
+approximately 9 KB shaped request containing `PHP_SESSION_UPLOAD_PROGRESS`,
+three `t[]` fields, and two 4 KB file parts. Both requests use the same cookie
+context; a custom `Cookie` header is preserved. No large probes are built or sent
+in this mode. Control redirects and connection failures stop the check early.
+
+| WAF verdict | Meaning |
+|---|---|
+| `BLOCKED` | Control returned 2xx or 404; shaped request returned 403 with a Cloudflare block-page marker. |
+| `NOT BLOCKED` | Control and shaped request returned 2xx or 404; no blocking was observed for this layout. |
+| `INCONCLUSIVE` | The control was rejected or failed at the server, or the shaped response did not establish Cloudflare blocking. Includes non-Cloudflare 403 responses. |
+| `REDIRECT` | A request redirected. Retest the intended endpoint; redirects are not followed. |
+| `ERROR` | A request failed or the target URL was invalid. |
+
+These results describe only the tested request shape. A Cloudflare block page
+does not identify the rule that fired or prove protection against other payloads.
+An accepted request does not prove that PHP handled it. This mode does not assess
+PHP patch status or exploitability; verify installed versions separately.
+
+The existing URL, path, header, timeout, TLS, and threading options apply.
+`--sapi` applies only to the default vulnerability scan. JSON output includes all
+WAF results without requiring `--all-results`, with `mode: "waf"`, a nullable
+`waf_blocked` field, and `vulnerable: null`. With multiple paths, a host is reported
+blocked only if every tested path is blocked; an observed `NOT BLOCKED` path takes
+precedence over an inconclusive path. `--quiet` prints only checks that are not
+confirmed blocked. Exit status is 0 only when every tested target/path is blocked,
+1 otherwise, or 2 if the output file cannot be written.
+
 ## Requirements
 
 - Python 3.9+
@@ -82,8 +120,9 @@ python3 scanner.py -u https://example.com --sapi fpm
 -k, --insecure    Disable TLS certificate verification
 -H, --header      Custom header (can be used multiple times)
 -v, --verbose     Show verdict reasons and response snippets
--q, --quiet       Only output vulnerable hosts
+-q, --quiet       Only output vulnerable hosts, or WAF checks not confirmed blocked
 --no-color        Disable colored output
+--waf-check       Check selective WAF blocking using only small multipart requests
 --sapi            Verdict rules: auto, mod_php, or fpm (default: auto)
 --path            Custom path to test (can be used multiple times)
 --path-file       File containing paths to test (one per line)
@@ -95,9 +134,13 @@ The first, original discovery of php2shell is attributed to the Calif team. You 
 
 The scanner was built by the Assetnote Security Research Team using logic built for [Searchlight's Exposure Platform](https://www.slcyber.io/exposure).
 
+The lightweight WAF-check technique and multipart layout are adapted from
+[php2shell_waf_check](https://github.com/msuiche/php2shell_waf_check) by
+Matt Suiche, Tolmo ([@msuiche](https://github.com/msuiche)).
+
 ## Output
 
-Results are printed to the terminal. When using `-o`, vulnerable hosts are saved to a JSON file with the verdict reason and redacted HTTP request/response evidence.
+Results are printed to the terminal. When using `-o`, vulnerable hosts are saved to a JSON file with the verdict reason and redacted HTTP request/response evidence. Use `--all-results` to save all vulnerability-scan results. In `--waf-check` mode, all WAF results are saved automatically.
 
 ## Limitations
 
@@ -106,3 +149,9 @@ On specific PHP configurations, the scanner may report a false positive when its
 This was reproduced on patched PHP 8.4.27 with `memory_limit` values from **2M to 32M**, and on PHP 8.3.36 at **128M** when `max_multipart_body_parts` is set to **2785 or higher**. The exact threshold may vary between builds.
 
 When PHP does not disclose its version, the scanner cannot distinguish this safe post-patch OOM from the vulnerable pre-patch behavior. Results should therefore be verified against the installed PHP version and any vendor backports
+
+## Tests
+
+After installing the requirements, run `python3 -m unittest discover -s tests -v`.
+The tests use mocked responses and a local HTTP server; they do not probe external
+targets.

@@ -59,6 +59,8 @@ DEFAULT_USER_AGENT = (
 )
 
 PROBES = ((1, 4000), (8, 1020), (20, 1020))
+WAF_BOUNDARY = "php2shell-waf-check"
+CF_BLOCK_MARKER = b"attention required! | cloudflare"
 REJECTED_STATUSES = {400, 403, 411, 413, 414, 417, 422, 429, 431}
 FIXED_VERSIONS = {(8, 2): 35, (8, 3): 36, (8, 4): 27, (8, 5): 12}
 VERSION_PATTERN = re.compile(r"PHP/(\d+)\.(\d+)\.(\d+)")
@@ -757,6 +759,105 @@ def response_metadata(response: HTTPResult) -> dict:
     }
 
 
+def build_waf_body(shaped: bool) -> bytes:
+    """Small multipart layout adapted from Matt Suiche's php2shell_waf_check."""
+    fields = (
+        [("PHP_SESSION_UPLOAD_PROGRESS", "probe")]
+        + [("t[]", letter * 32) for letter in "ABC"]
+        if shaped
+        else [("wafprobe", "benign")]
+    )
+    chunks = []
+    for name, value in fields:
+        chunks.append(
+            f'--{WAF_BOUNDARY}\r\nContent-Disposition: form-data; '
+            f'name="{name}"\r\n\r\n{value}\r\n'.encode("ascii")
+        )
+    if shaped:
+        for index, letter in enumerate((b"A", b"B"), start=1):
+            filename = "first.bin" if index == 1 else "second.bin"
+            chunks.append(
+                f'--{WAF_BOUNDARY}\r\nContent-Disposition: form-data; '
+                f'name="file{index}"; filename="{filename}"\r\n'
+                "Content-Type: application/octet-stream\r\n\r\n".encode("ascii")
+                + letter * 4096
+                + b"\r\n"
+            )
+    chunks.append(f"--{WAF_BOUNDARY}--\r\n".encode("ascii"))
+    return b"".join(chunks)
+
+
+def check_waf_url(
+    host: str,
+    target_url: str,
+    timeout: int,
+    verify_ssl: bool,
+    custom_headers: Dict[str, str],
+) -> dict:
+    result = base_result(host)
+    result.update(
+        mode="waf", waf_blocked=None, tested_url=target_url, final_url=target_url
+    )
+    headers = dict(custom_headers)
+    # Keep session context identical for the control and shaped requests.
+    if not has_header(headers, "Cookie"):
+        headers["Cookie"] = "PHPSESSID=wafprobe0001"
+    responses = []
+    for shaped in (False, True):
+        body = build_waf_body(shaped)
+        response = send_post(
+            target_url, body, WAF_BOUNDARY, headers, timeout, verify_ssl
+        )
+        responses.append(response)
+        result["request"] = request_dump(
+            target_url,
+            request_headers(headers, WAF_BOUNDARY),
+            len(body),
+            "small php2shell-shaped WAF probe" if shaped else "benign multipart control",
+        )
+        apply_response(result, response)
+        if shaped:
+            result["probes"].append(response_metadata(response))
+        else:
+            result["control"] = response_metadata(response)
+        if response.error or response.status_code is None:
+            result["error"] = response.error or "no HTTP status received"
+            result["reason"] = result["error"]
+            return result
+        if 300 <= response.status_code < 400:
+            result["verdict"] = "REDIRECT"
+            result["reason"] = "request redirected; rerun against the intended endpoint"
+            return result
+
+    control, probe = responses
+    result["verdict"] = "INCONCLUSIVE"
+    if not (200 <= control.status_code < 300 or control.status_code == 404):
+        result["reason"] = (
+            f"benign multipart returned HTTP {control.status_code}; "
+            "cannot establish selective blocking"
+        )
+    elif probe.status_code == 403 and CF_BLOCK_MARKER in probe.body.lower():
+        result["waf_blocked"] = True
+        result["verdict"] = "BLOCKED"
+        result["reason"] = (
+            "exploit-shaped request selectively blocked with a Cloudflare block page; "
+            "this does not identify the rule or establish origin patch status"
+        )
+    elif 200 <= probe.status_code < 300 or probe.status_code == 404:
+        result["waf_blocked"] = False
+        result["verdict"] = "NOT BLOCKED"
+        result["reason"] = (
+            "no blocking observed for this exploit-shaped request; "
+            "this does not establish origin vulnerability or reachability"
+        )
+    else:
+        result["reason"] = (
+            f"shaped request returned HTTP {probe.status_code} without a confirmed "
+            "Cloudflare block; cannot establish WAF mitigation"
+        )
+    return result
+
+
 def check_url(
     host: str,
     target_url: str,
@@ -932,12 +1033,15 @@ def check_vulnerability(
     custom_headers: Optional[Dict[str, str]] = None,
     sapi: str = "auto",
     paths: Optional[List[str]] = None,
+    waf_check: bool = False,
 ) -> dict:
     display_host = safe_url_label(host)
     try:
         normalized = normalize_url(host)
     except ValueError as exc:
         result = base_result(display_host)
+        if waf_check:
+            result.update(mode="waf", waf_blocked=None)
         result["error"] = str(exc)
         result["reason"] = str(exc)
         return result
@@ -947,14 +1051,18 @@ def check_vulnerability(
     )
     fallback: Optional[dict] = None
     fallback_priority = {"NO SIGNAL": 0, "FIXED": 1, "INCONCLUSIVE": 2, "ERROR": 2}
+    if waf_check:
+        fallback_priority = {
+            "BLOCKED": 0, "NOT BLOCKED": 3, "INCONCLUSIVE": 2,
+            "ERROR": 2, "REDIRECT": 2,
+        }
     for target_url in targets:
-        result = check_url(
-            normalized,
-            target_url,
-            timeout,
-            verify_ssl,
-            custom_headers or {},
-            sapi,
+        result = (
+            check_waf_url(normalized, target_url, timeout, verify_ssl, custom_headers or {})
+            if waf_check
+            else check_url(
+                normalized, target_url, timeout, verify_ssl, custom_headers or {}, sapi
+            )
         )
         if result["vulnerable"] is True:
             return result
@@ -1028,7 +1136,10 @@ def save_results(
 def print_result(result: dict, verbose: bool = False) -> None:
     host = result["host"]
     verdict = result["verdict"]
-    if result["vulnerable"] is True:
+    if result.get("mode") == "waf":
+        color = Colors.GREEN if result.get("waf_blocked") is True else Colors.YELLOW
+        status = colorize(f"[WAF {verdict}]", color)
+    elif result["vulnerable"] is True:
         status = colorize("[VULNERABLE]", Colors.RED + Colors.BOLD)
     elif result["vulnerable"] is False:
         status = colorize("[NOT VULNERABLE]", Colors.GREEN)
@@ -1091,6 +1202,11 @@ Examples:
         help="Save all results, not only vulnerable hosts",
     )
     parser.add_argument(
+        "--waf-check",
+        action="store_true",
+        help="Only send small multipart requests to check selective WAF blocking",
+    )
+    parser.add_argument(
         "-k",
         "--insecure",
         action="store_true",
@@ -1111,7 +1227,9 @@ Examples:
         help="Show verdict reasons and response snippets",
     )
     parser.add_argument(
-        "-q", "--quiet", action="store_true", help="Only print vulnerable hosts"
+        "-q", "--quiet",
+        action="store_true",
+        help="Only print vulnerable hosts (or WAF checks that are not confirmed blocked)",
     )
     parser.add_argument(
         "--no-color", action="store_true", help="Disable colored output"
@@ -1176,7 +1294,12 @@ def main() -> None:
             print(colorize(f"[*] Default path: {DEFAULT_PATH}", Colors.CYAN))
         print(colorize(f"[*] Using {args.threads} thread(s)", Colors.CYAN))
         print(colorize(f"[*] Timeout: {args.timeout}s", Colors.CYAN))
-        print(colorize(f"[*] SAPI rules: {args.sapi}", Colors.CYAN))
+        if args.waf_check:
+            print(colorize(
+                "[*] WAF check: small requests only; no patch assessment", Colors.CYAN
+            ))
+        else:
+            print(colorize(f"[*] SAPI rules: {args.sapi}", Colors.CYAN))
         if args.insecure:
             print(colorize("[!] TLS verification disabled", Colors.YELLOW))
         print()
@@ -1195,21 +1318,31 @@ def main() -> None:
                 custom_headers=custom_headers,
                 sapi=args.sapi,
                 paths=paths,
+                waf_check=args.waf_check,
             )
         except Exception as exc:  # Keep one bad target from aborting a scan.
             result = base_result(safe_url_label(host))
+            if args.waf_check:
+                result.update(mode="waf", waf_blocked=None)
             result["error"] = f"unexpected error: {exc}"
             result["reason"] = result["error"]
             return result
 
-    if len(hosts) > 1:
+    def needs_attention(result: dict) -> bool:
+        return (
+            result.get("waf_blocked") is not True
+            if args.waf_check
+            else result["vulnerable"] is True
+        )
+
+    if len(hosts) > 1 and not args.waf_check:
         for probe in PROBES:
             build_probe_body(*probe)
 
     if len(hosts) == 1:
         result = scan(hosts[0])
         results.append(result)
-        if not args.quiet or result["vulnerable"] is True:
+        if not args.quiet or needs_attention(result):
             print_result(result, args.verbose)
     else:
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
@@ -1225,8 +1358,8 @@ def main() -> None:
                     result = future.result()
                     results.append(result)
 
-                    should_print = result["vulnerable"] is True or (
-                        not args.quiet and args.verbose
+                    should_print = needs_attention(result) or (
+                        not args.quiet and (args.waf_check or args.verbose)
                     )
                     if should_print:
                         if args.quiet:
@@ -1244,12 +1377,21 @@ def main() -> None:
         print(colorize("SCAN SUMMARY", Colors.BOLD))
         print(colorize("=" * 60, Colors.CYAN))
         print(f"  Total hosts scanned: {len(hosts)}")
-        vulnerable_label = f"Vulnerable: {vulnerable_count}"
-        if vulnerable_count:
-            vulnerable_label = colorize(vulnerable_label, Colors.RED + Colors.BOLD)
-        print(f"  {vulnerable_label}")
-        print(f"  Not vulnerable: {len(results) - vulnerable_count - error_count}")
-        print(f"  Inconclusive/errors: {error_count}")
+        if args.waf_check:
+            blocked = sum(result.get("waf_blocked") is True for result in results)
+            not_blocked = sum(result.get("waf_blocked") is False for result in results)
+            print(f"  Exploit-shaped request blocked: {blocked}")
+            print(f"  Not blocked: {not_blocked}")
+            print(
+                f"  Inconclusive/redirects/errors: {len(results) - blocked - not_blocked}"
+            )
+        else:
+            vulnerable_label = f"Vulnerable: {vulnerable_count}"
+            if vulnerable_count:
+                vulnerable_label = colorize(vulnerable_label, Colors.RED + Colors.BOLD)
+            print(f"  {vulnerable_label}")
+            print(f"  Not vulnerable: {len(results) - vulnerable_count - error_count}")
+            print(f"  Inconclusive/errors: {error_count}")
         print(colorize("=" * 60, Colors.CYAN))
 
     output_saved = True
@@ -1257,11 +1399,13 @@ def main() -> None:
         output_saved = save_results(
             results,
             args.output,
-            vulnerable_only=not args.all_results,
+            vulnerable_only=not (args.all_results or args.waf_check),
             announce=not args.quiet,
         )
     if not output_saved:
         raise SystemExit(2)
+    if args.waf_check:
+        raise SystemExit(1 if any(needs_attention(result) for result in results) else 0)
     raise SystemExit(1 if vulnerable_count else 0)
 
 
