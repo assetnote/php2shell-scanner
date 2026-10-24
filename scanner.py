@@ -70,6 +70,12 @@ SENSITIVE_HEADERS = {
     "set-cookie",
     "x-api-key",
 }
+SENSITIVE_HEADER_PATTERN = re.compile(
+    r"(?:^|[-_])(?:auth|authorization|bearer|cookie|key|passwd|password|"
+    r"secret|session|token)(?:$|[-_])"
+    r"|apikey|accesskey",
+    re.IGNORECASE,
+)
 
 
 class Colors:
@@ -633,7 +639,7 @@ def send_post(
             new.netloc.lower(),
         ):
             for name in list(headers):
-                if name.lower() in SENSITIVE_HEADERS or name.lower() == "host":
+                if is_sensitive_header(name) or name.lower() == "host":
                     del headers[name]
         current_url = next_url
     return result
@@ -744,8 +750,15 @@ def request_dump(
     return "\r\n".join(lines) + f"\r\n\r\n<{description}; {body_size} bytes>"
 
 
+def is_sensitive_header(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in SENSITIVE_HEADERS or bool(
+        SENSITIVE_HEADER_PATTERN.search(lowered)
+    )
+
+
 def redact_header(name: str, value: str) -> str:
-    return "<redacted>" if name.lower() in SENSITIVE_HEADERS else value
+    return "<redacted>" if is_sensitive_header(name) else value
 
 
 def terminal_safe(value: str) -> str:
