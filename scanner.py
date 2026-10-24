@@ -646,6 +646,10 @@ def version_verdict(powered_by: str) -> Optional[str]:
     major, minor, patch = (int(value) for value in match.groups())
     fixed_patch = FIXED_VERSIONS.get((major, minor))
     if fixed_patch is None:
+        # Older branches never received an official fix. Leave unknown newer
+        # branches undecided until their first fixed release is known.
+        if (major, minor) < min(FIXED_VERSIONS):
+            return "VULNERABLE"
         return None
     return "FIXED" if patch >= fixed_patch else "VULNERABLE"
 
